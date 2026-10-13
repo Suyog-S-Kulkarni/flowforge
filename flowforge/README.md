@@ -25,6 +25,10 @@ FlowForge addresses these questions through dependency validation, bounded
 concurrent execution, configurable retry policies, and versioned workflow
 definition storage.
 
+## Verified milestone
+
+On 12 October 2026, the local suite passed **64 tests with zero failures, errors, or skips**. Live Postman checks confirmed reader GET 200, reader creation 403, cross-tenant GET 404, and unauthenticated GET 401. Security tests mock JWT decoding; live Keycloak checks complement them.
+
 ## Implemented Features
 
 - Workflow validation for missing dependencies, duplicate task identifiers,
@@ -39,6 +43,10 @@ definition storage.
 - Task status and attempt counts in execution results.
 - REST endpoints for validation and execution previews.
 - MySQL schema management with Flyway.
+- Transactional workflow definition creation and tenant-scoped version retrieval.
+- Keycloak JWT signature, issuer, timestamp, audience and tenant validation.
+- Independent `workflow-read` and `workflow-write` realm-role permissions.
+- Postman browser login using authorization code with PKCE S256.
 - Automated tests for validation, execution, retries, REST behavior, and
   database integration.
 
@@ -51,11 +59,12 @@ payments or call external business services.
 |---|---|
 | Language | Java 21 |
 | Backend | Spring Boot |
+| Security | Spring Security OAuth2 Resource Server, standalone Keycloak |
 | REST APIs | Spring MVC, Jakarta Bean Validation |
 | Concurrency | ExecutorService, CompletionService, DelayQueue |
 | Persistence | MySQL, Spring JDBC |
 | Schema migrations | Flyway |
-| Testing | JUnit 5, Spring Boot Test, MockMvc |
+| Testing | JUnit, Spring Boot Test, MockMvc |
 | Build | Maven Wrapper |
 | Manual API testing | Postman |
 
@@ -66,7 +75,9 @@ between the API, application, domain, and persistence layers.
 
 ```mermaid
 flowchart TD
-    Client["Postman / API client"] --> API["REST controllers"]
+    Client["Postman / API client"] --> Security["JWT and role checks"]
+    Security --> API["REST controllers"]
+    API --> Service["Workflow definition service"]
     API --> Validator["Workflow validator"]
     API --> Engine["Workflow execution engine"]
     Engine --> Executor["Managed executor"]
@@ -81,8 +92,7 @@ flowchart TD
     Flyway["Flyway migrations"] --> DB
 ```
 
-The persistence service is separate from the preview endpoints. Secured
-workflow management APIs are planned.
+Stored-definition endpoints use the authenticated tenant from `CurrentTenant`. The service calls the JDBC repository with that tenant. Preview execution remains in memory and accepts a submitted definition; executing a stored version is the next milestone.
 
 ## Execution Flow
 
@@ -204,12 +214,64 @@ Health endpoint:
 GET http://localhost:8082/actuator/health
 ```
 
+## Authentication and permissions
+
+Start standalone Keycloak from its installation directory:
+
+```cmd
+bin\kc.bat start-dev --http-port=8081
+```
+
+Create realm `flowforge` and public OIDC client `flowforge-postman`. Set client authentication Off, Standard flow On, Direct access grants Off, Require PKCE On and PKCE Method S256. Register the exact callback displayed by Postman; do not use a wildcard.
+
+Define the single-valued user attribute `tenant_id` with Admin-only edit/view permissions and no default. Assign Tenant A `11111111-1111-4111-8111-111111111111` and Tenant B `22222222-2222-4222-8222-222222222222`.
+
+In the client's dedicated scope, add a User Attribute mapper from `tenant_id` to the String access-token claim `tenant_id`, with multivalued Off. Add an Audience mapper with custom audience `flowforge-api`. Keep the default roles scope and permit the application roles in any restricted role scope mappings.
+
+Create independent realm roles `workflow-read` and `workflow-write`. Assign both to `tenant-a-user` and `tenant-b-user`. Assign only read to `tenant-a-reader`, who belongs to Tenant A. Set local user passwords without committing them.
+
+In Postman use OAuth 2.0, Authorization Code with PKCE, browser login, S256, scope `openid`, client ID `flowforge-postman` and no client secret. URLs:
+
+- Authorization: `http://localhost:8081/realms/flowforge/protocol/openid-connect/auth`
+- Token: `http://localhost:8081/realms/flowforge/protocol/openid-connect/token`
+
+Obtain fresh tokens after role changes. Login as the intended user, not merely with a different token label. `/api/me` returns the user's subject and tenant. Tokens are sent through `Authorization: Bearer <access-token>`.
+
+| Endpoint | Permission |
+|---|---|
+| GET /actuator/health | Public |
+| GET /api/me | Valid authenticated tenant token |
+| POST /api/workflows | workflow-write |
+| GET /api/workflows/{workflowId}/versions/{version} | workflow-read |
+| POST /api/workflows/validate | workflow-write |
+| POST /api/workflows/execute-preview | workflow-write |
+
+```mermaid
+flowchart TD
+    A["Bearer token"] --> B{"JWT and tenant valid?"}
+    B -->|No| C["401"]
+    B -->|Yes| D{"Required role?"}
+    D -->|No| E["403"]
+    D -->|Yes| F["Resolve tenant from token"]
+    F --> G["Query tenant, workflow and version"]
+    G --> H{"Record found?"}
+    H -->|Yes| I["200 definition"]
+    H -->|No| J["404"]
+```
+
+### Create and retrieve a stored definition
+
+Send the example JSON below to `POST /api/workflows` with a writer token and `Content-Type: application/json`. Expect 201 and a Location header. Save the returned `workflowId`, not `versionId`. Retrieve it using `GET /api/workflows/{workflowId}/versions/1` with a read-authorized token from the same tenant.
+
+Creation stores the definition without executing it. Repeated POSTs create new workflows; creation is not idempotent. A caller-supplied tenant header cannot change ownership. Foreign-tenant and missing records both return 404.
+
 ## API Examples
 
 ### Validate a Workflow
 
 ```http
 POST http://localhost:8082/api/workflows/validate
+Authorization: Bearer <access-token>
 Content-Type: application/json
 ```
 
@@ -242,6 +304,7 @@ Send the same JSON body to:
 
 ```http
 POST http://localhost:8082/api/workflows/execute-preview
+Authorization: Bearer <access-token>
 Content-Type: application/json
 ```
 
@@ -269,23 +332,23 @@ Automated tests cover:
 - REST request validation and error responses.
 - Application context and database migration checks.
 
-Postman is used to manually exercise workflow validation and execution
-preview requests.
+Postman also verifies live Keycloak login, definition creation, same-tenant reader access, reader write denial, cross-tenant isolation and unauthenticated rejection. Database/API integration tests require the separate test schema and credentials.
 
 ## Current Scope and Limitations
 
 - Execution previews run in memory.
 - Execution state is not recovered after an application restart.
-- Preview admission is limited within one application instance.
+- Only one preview is admitted across all tenants per application instance; competing requests receive 429.
 - Task handlers simulate outcomes.
-- Authentication and authorization are planned.
+- Authorization is enforced at the HTTP layer; service methods receive an explicit tenant.
+- No task timeout or user cancellation endpoint is implemented.
+- No persisted runs, restart recovery, creation idempotency or additional-version API is implemented.
 - This is a local development project, not a production workflow platform.
 
 ## Roadmap
 
-- Spring Security and Keycloak JWT authentication.
-- Role-based access control.
-- Authenticated tenant-scoped workflow management APIs.
+- Execute a stored workflow version using tenant-scoped lookup.
+- Add task deadlines, cancellation and tenant-aware admission.
 - Persistent execution history.
 - Additional operational controls and observability.
 - CI automation for build and test verification.
